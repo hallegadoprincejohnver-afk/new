@@ -320,7 +320,7 @@ async function sendCallback(payload) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(CALLBACK_SECRET ? { "x-worker-secret": CALLBACK_SECRET } : {}),
+      ...(CALLBACK_SECRET ? { "x-trw-worker-secret": CALLBACK_SECRET } : {}),
     },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(10_000),
