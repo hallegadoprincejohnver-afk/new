@@ -3,6 +3,8 @@ import https from "node:https";
 import dns from "node:dns";
 import net from "node:net";
 import { URL } from "node:url";
+import crypto from "node:crypto";
+import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 10000);
 const API_SECRET = String(process.env.API_SECRET || "").trim();
@@ -24,6 +26,19 @@ const ALLOWED_TARGET_HOSTS = new Set(
 const queue = [];
 let activeJobs = 0;
 const rateBuckets = new Map();
+const BROWSER_SESSION_TIMEOUT_MS = clampInt(
+  process.env.BROWSER_SESSION_TIMEOUT_MS,
+  60_000,
+  1_800_000,
+  600_000,
+);
+const MAX_BROWSER_SESSIONS = clampInt(
+  process.env.MAX_BROWSER_SESSIONS,
+  1,
+  8,
+  3,
+);
+const browserSessions = new Map();
 
 function clampInt(value, min, max, fallback) {
   const n = Number.parseInt(String(value ?? ""), 10);
@@ -145,6 +160,205 @@ async function resolveSafe(hostname) {
   }
   return answers;
 }
+
+function safeBrowserAction(action) {
+  const allowed = new Set([
+    "click",
+    "dblclick",
+    "move",
+    "wheel",
+    "press",
+    "type",
+    "reload",
+    "back",
+    "forward",
+  ]);
+  return typeof action === "string" && allowed.has(action);
+}
+
+async function closeBrowserSession(session) {
+  if (!session || session.closed) return;
+  session.closed = true;
+  browserSessions.delete(session.id);
+  await session.context.close().catch(() => {});
+  await session.browser.close().catch(() => {});
+}
+
+function getBrowserSession(id) {
+  const session = browserSessions.get(id);
+  if (!session || session.closed) return null;
+  if (Date.now() - session.last_activity > BROWSER_SESSION_TIMEOUT_MS) {
+    void closeBrowserSession(session);
+    return null;
+  }
+  return session;
+}
+
+async function createBrowserSession(url) {
+  if (browserSessions.size >= MAX_BROWSER_SESSIONS) {
+    throw new Error("browser_session_limit");
+  }
+
+  const initial = cleanUrl(url);
+  if (!initial) throw new Error("invalid_url");
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    locale: "en-US",
+  });
+
+  const page = await context.newPage();
+  const id = crypto.randomUUID();
+  const session = {
+    id,
+    browser,
+    context,
+    page,
+    initial_url: initial,
+    current_url: initial,
+    created_at: Date.now(),
+    last_activity: Date.now(),
+    ready: false,
+    closed: false,
+  };
+
+  browserSessions.set(id, session);
+
+  page.on("framenavigated", () => {
+    session.current_url = page.url();
+    session.last_activity = Date.now();
+  });
+
+  page.on("close", () => {
+    session.closed = true;
+    browserSessions.delete(id);
+  });
+
+  try {
+    await page.goto(initial, {
+      waitUntil: "domcontentloaded",
+      timeout: REQUEST_TIMEOUT_MS,
+    });
+  } catch (error) {
+    if (!page.url()) {
+      await closeBrowserSession(session);
+      throw error;
+    }
+  }
+
+  session.current_url = page.url();
+  return session;
+}
+
+async function browserSessionSnapshot(session) {
+  session.last_activity = Date.now();
+  session.current_url = session.page.url();
+
+  const body = await session.page.content().catch(() => "");
+  const title = await session.page.title().catch(() => "");
+  const challenge = looksLikeChallenge(
+    title + "\n" + body,
+    {},
+  );
+
+  session.ready = !challenge;
+
+  const screenshot = await session.page.screenshot({
+    type: "png",
+    fullPage: false,
+  });
+
+  return {
+    ok: true,
+    session_id: session.id,
+    ready: session.ready,
+    current_url: session.current_url,
+    title,
+    screenshot_base64: screenshot.toString("base64"),
+  };
+}
+
+async function performBrowserAction(session, body) {
+  if (!safeBrowserAction(body?.action)) {
+    throw new Error("unsupported_browser_action");
+  }
+
+  session.last_activity = Date.now();
+  const page = session.page;
+
+  switch (body.action) {
+    case "click":
+      if (!Number.isFinite(Number(body.x)) || !Number.isFinite(Number(body.y))) {
+        throw new Error("invalid_click_coordinates");
+      }
+      await page.mouse.click(Number(body.x), Number(body.y));
+      break;
+
+    case "dblclick":
+      if (!Number.isFinite(Number(body.x)) || !Number.isFinite(Number(body.y))) {
+        throw new Error("invalid_click_coordinates");
+      }
+      await page.mouse.dblclick(Number(body.x), Number(body.y));
+      break;
+
+    case "move":
+      if (!Number.isFinite(Number(body.x)) || !Number.isFinite(Number(body.y))) {
+        throw new Error("invalid_move_coordinates");
+      }
+      await page.mouse.move(Number(body.x), Number(body.y));
+      break;
+
+    case "wheel":
+      await page.mouse.wheel(
+        Number.isFinite(Number(body.delta_x)) ? Number(body.delta_x) : 0,
+        Number.isFinite(Number(body.delta_y)) ? Number(body.delta_y) : 0,
+      );
+      break;
+
+    case "press":
+      if (typeof body.key !== "string" || !body.key.trim()) {
+        throw new Error("missing_key");
+      }
+      await page.keyboard.press(body.key);
+      break;
+
+    case "type":
+      if (typeof body.text !== "string") {
+        throw new Error("missing_text");
+      }
+      await page.keyboard.type(body.text.slice(0, 2_000));
+      break;
+
+    case "reload":
+      await page.reload({ waitUntil: "domcontentloaded", timeout: REQUEST_TIMEOUT_MS }).catch(() => {});
+      break;
+
+    case "back":
+      await page.goBack({ waitUntil: "domcontentloaded", timeout: REQUEST_TIMEOUT_MS }).catch(() => {});
+      break;
+
+    case "forward":
+      await page.goForward({ waitUntil: "domcontentloaded", timeout: REQUEST_TIMEOUT_MS }).catch(() => {});
+      break;
+  }
+
+  await page.waitForTimeout(250).catch(() => {});
+  return browserSessionSnapshot(session);
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - BROWSER_SESSION_TIMEOUT_MS;
+  for (const session of browserSessions.values()) {
+    if (session.last_activity <= cutoff) {
+      void closeBrowserSession(session);
+    }
+  }
+}, 30_000).unref();
 
 function requestOnce(target, bodyNeeded = true) {
   return new Promise(async (resolve, reject) => {
@@ -427,6 +641,75 @@ async function handle(req, res) {
       service: "clear-processor-api",
       endpoints: ["/health", "/resolve", "/process"],
     });
+  }
+
+  if (req.method === "POST" && pathname === "/browser/session") {
+    if (!requireAuth(req)) {
+      return json(res, 401, { ok: false, error: "unauthorized" });
+    }
+
+    const ip = getClientIp(req);
+    if (!consumeRateLimit(ip)) {
+      return json(res, 429, { ok: false, error: "rate_limited" });
+    }
+
+    let body;
+    try {
+      body = await readJson(req);
+    } catch {
+      return json(res, 400, { ok: false, error: "invalid_json" });
+    }
+
+    try {
+      const session = await createBrowserSession(body?.url);
+      return json(res, 201, await browserSessionSnapshot(session));
+    } catch (error) {
+      return json(res, 400, {
+        ok: false,
+        error: String(error instanceof Error ? error.message : error),
+      });
+    }
+  }
+
+  const browserMatch = pathname.match(/^\/browser\/session\/([a-f0-9-]+)(?:\/(action|close))?$/i);
+  if (browserMatch && (req.method === "GET" || req.method === "POST")) {
+    if (!requireAuth(req)) {
+      return json(res, 401, { ok: false, error: "unauthorized" });
+    }
+
+    const session = getBrowserSession(browserMatch[1]);
+    if (!session) {
+      return json(res, 404, { ok: false, error: "browser_session_not_found" });
+    }
+
+    if (req.method === "GET") {
+      try {
+        return json(res, 200, await browserSessionSnapshot(session));
+      } catch {
+        return json(res, 500, { ok: false, error: "browser_snapshot_failed" });
+      }
+    }
+
+    if (browserMatch[2] === "close") {
+      await closeBrowserSession(session);
+      return json(res, 200, { ok: true, closed: true });
+    }
+
+    let body;
+    try {
+      body = await readJson(req);
+    } catch {
+      return json(res, 400, { ok: false, error: "invalid_json" });
+    }
+
+    try {
+      return json(res, 200, await performBrowserAction(session, body));
+    } catch (error) {
+      return json(res, 400, {
+        ok: false,
+        error: String(error instanceof Error ? error.message : error),
+      });
+    }
   }
 
   if ((req.method === "POST" && (pathname === "/resolve" || pathname === "/process"))) {
