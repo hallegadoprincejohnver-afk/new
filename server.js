@@ -202,6 +202,9 @@ async function createBrowserSession(url) {
   const initial = cleanUrl(url);
   if (!initial) throw new Error("invalid_url");
 
+  const parsedInitial = new URL(initial);
+  await resolveSafe(parsedInitial.hostname);
+
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -213,6 +216,23 @@ async function createBrowserSession(url) {
   });
 
   const page = await context.newPage();
+
+  await page.route("**/*", async (route) => {
+    const requestUrl = route.request().url();
+
+    if (!/^https?:$/i.test(new URL(requestUrl).protocol)) {
+      await route.continue();
+      return;
+    }
+
+    try {
+      await resolveSafe(new URL(requestUrl).hostname);
+      await route.continue();
+    } catch {
+      await route.abort("blockedbyclient");
+    }
+  });
+
   const id = crypto.randomUUID();
   const session = {
     id,
