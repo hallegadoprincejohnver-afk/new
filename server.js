@@ -307,7 +307,7 @@ async function resolvePublicUrl(inputUrl) {
 
 function requireAuth(req) {
   if (!API_SECRET) return false;
-  const supplied = String(req.headers["x-api-key"] || "");
+  const supplied = String(req.headers["x-api-key"] || req.headers["x-trw-worker-secret"] || req.headers["x-processor-secret"] || "");
   return supplied && supplied === API_SECRET;
 }
 
