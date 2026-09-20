@@ -468,12 +468,12 @@ function absolutize(baseUrl, location) {
 
 function looksLikeChallenge(body, headers) {
   const text = String(body || "").toLowerCase();
-  const title = (text.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i)?.[1] || "").trim();
   const server = String(headers?.server || "").toLowerCase();
 
-  // Do not classify a page as a challenge merely because it references
-  // CAPTCHA/Turnstile JavaScript. Only flag concrete challenge indicators.
-  const concreteChallengeMarkers = [
+  // LootLabs pages can legitimately load CAPTCHA/Turnstile scripts.
+  // Only classify a response as an active challenge when there are
+  // concrete challenge-page indicators.
+  const challengeMarkers = [
     "cf-chl-",
     "challenge-platform",
     "just a moment...",
@@ -482,26 +482,20 @@ function looksLikeChallenge(body, headers) {
     "performing security verification",
     "enable javascript and cookies to continue",
     "attention required! | cloudflare",
-    "ray id:",
   ];
 
-  if (server.includes("cloudflare") && (
-    concreteChallengeMarkers.some((marker) => text.includes(marker)) ||
-    /<form[^>]+action=["'][^"']*(?:challenge|captcha|turnstile)/i.test(text) ||
-    /class=["'][^"']*(?:cf-chl-|challenge|turnstile)/i.test(text)
-  )) {
-    return true;
+  const markerHit = challengeMarkers.some((marker) => text.includes(marker));
+  const challengeForm =
+    /<form[^>]+action=["'][^"']*(?:challenge|captcha|turnstile)/i.test(text);
+  const challengeElement =
+    /(?:id|class)=["'][^"']*(?:cf-chl-|challenge|turnstile)/i.test(text);
+
+  if (server.includes("cloudflare")) {
+    return markerHit || challengeForm || challengeElement;
   }
 
-  if (concreteChallengeMarkers.some((marker) => title.includes(marker))) {
-    return true;
-  }
-
-  return concreteChallengeMarkers.some((marker) => text.includes(marker)) ||
-    /<form[^>]+action=["'][^"']*(?:challenge|captcha|turnstile)/i.test(text) ||
-    /id=["'][^"']*(?:cf-chl-|challenge|turnstile)/i.test(text);
+  return markerHit || challengeForm || challengeElement;
 }
-
 function extractMetaRefresh(body, baseUrl) {
   const match = String(body || "").match(
     /<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["'][^"']*url\s*=\s*([^"']+)/i,
