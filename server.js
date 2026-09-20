@@ -632,12 +632,10 @@ async function resolvePublicUrl(inputUrl) {
     if (isLootLabsWrapperHost(new URL(current).hostname)) {
       try {
         const browserResult = await resolveLootLabsWithBrowser(current);
-        if (browserResult.ok || browserResult.code === "human_verification_required") {
-          return {
-            ...browserResult,
-            redirects: Math.max(chain.length - 1, Number(browserResult.redirects || 0)),
-          };
-        }
+        return {
+          ...browserResult,
+          redirects: Math.max(chain.length - 1, Number(browserResult.redirects || 0)),
+        };
       } catch (error) {
         console.error("LootLabs browser resolution failed:", error instanceof Error ? error.message : error);
       }
