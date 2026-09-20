@@ -504,6 +504,109 @@ function extractMetaRefresh(body, baseUrl) {
   return absolutize(baseUrl, match[1].trim());
 }
 
+
+function isLootLabsWrapperHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/\.$/, "");
+  return (
+    host === "loot-link.com" ||
+    host.endsWith(".loot-link.com") ||
+    host === "lootlabs.gg" ||
+    host.endsWith(".lootlabs.gg")
+  );
+}
+
+async function resolveLootLabsWithBrowser(inputUrl) {
+  const initial = cleanUrl(inputUrl);
+  if (!initial) throw new Error("invalid_url");
+
+  const parsedInitial = new URL(initial);
+  if (!isLootLabsWrapperHost(parsedInitial.hostname)) {
+    throw new Error("not_lootlabs_url");
+  }
+
+  await resolveSafe(parsedInitial.hostname);
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    locale: "en-US",
+  });
+
+  const page = await context.newPage();
+
+  await page.route("**/*", async (route) => {
+    const requestUrl = route.request().url();
+
+    if (!/^https?:$/i.test(new URL(requestUrl).protocol)) {
+      await route.continue();
+      return;
+    }
+
+    try {
+      await resolveSafe(new URL(requestUrl).hostname);
+      await route.continue();
+    } catch {
+      await route.abort("blockedbyclient");
+    }
+  });
+
+  try {
+    await page.goto(initial, {
+      waitUntil: "domcontentloaded",
+      timeout: REQUEST_TIMEOUT_MS,
+    }).catch(() => {});
+
+    const firstUrl = page.url() || initial;
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await page.waitForTimeout(500).catch(() => {});
+
+      const currentUrl = page.url() || firstUrl;
+      const title = await page.title().catch(() => "");
+      const body = await page.content().catch(() => "");
+
+      if (looksLikeChallenge(title + "\n" + body, {})) {
+        return {
+          ok: false,
+          code: "human_verification_required",
+          message: "LootLabs requires browser or human verification. Clear does not bypass that protection.",
+          final_url: currentUrl,
+          redirects: 0,
+        };
+      }
+
+      if (
+        currentUrl !== firstUrl &&
+        !isLootLabsWrapperHost(new URL(currentUrl).hostname)
+      ) {
+        return {
+          ok: true,
+          final_url: currentUrl,
+          redirects: 1,
+          status: 200,
+          content_type: "text/html",
+          browser_resolved: true,
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      code: "lootlabs_no_automatic_destination",
+      message: "LootLabs did not expose an automatic destination without completing its required user flow.",
+      final_url: page.url() || firstUrl,
+      redirects: 0,
+    };
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+}
+
 async function resolvePublicUrl(inputUrl) {
   let current = cleanUrl(inputUrl);
   if (!current) throw new Error("invalid_url");
@@ -524,6 +627,20 @@ async function resolvePublicUrl(inputUrl) {
       if (!next) throw new Error("invalid_redirect_location");
       current = next;
       continue;
+    }
+
+    if (isLootLabsWrapperHost(new URL(current).hostname)) {
+      try {
+        const browserResult = await resolveLootLabsWithBrowser(current);
+        if (browserResult.ok || browserResult.code === "human_verification_required") {
+          return {
+            ...browserResult,
+            redirects: Math.max(chain.length - 1, Number(browserResult.redirects || 0)),
+          };
+        }
+      } catch (error) {
+        console.error("LootLabs browser resolution failed:", error instanceof Error ? error.message : error);
+      }
     }
 
     if (looksLikeChallenge(response.body, response.headers)) {
