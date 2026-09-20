@@ -468,16 +468,38 @@ function absolutize(baseUrl, location) {
 
 function looksLikeChallenge(body, headers) {
   const text = String(body || "").toLowerCase();
+  const title = (text.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i)?.[1] || "").trim();
   const server = String(headers?.server || "").toLowerCase();
-  return (
-    server.includes("cloudflare") ||
-    text.includes("cf-chl-") ||
-    text.includes("challenge-platform") ||
-    text.includes("just a moment...") ||
-    text.includes("verify you are human") ||
-    text.includes("captcha") ||
-    text.includes("turnstile")
-  );
+
+  // Do not classify a page as a challenge merely because it references
+  // CAPTCHA/Turnstile JavaScript. Only flag concrete challenge indicators.
+  const concreteChallengeMarkers = [
+    "cf-chl-",
+    "challenge-platform",
+    "just a moment...",
+    "verify you are human",
+    "checking your browser",
+    "performing security verification",
+    "enable javascript and cookies to continue",
+    "attention required! | cloudflare",
+    "ray id:",
+  ];
+
+  if (server.includes("cloudflare") && (
+    concreteChallengeMarkers.some((marker) => text.includes(marker)) ||
+    /<form[^>]+action=["'][^"']*(?:challenge|captcha|turnstile)/i.test(text) ||
+    /class=["'][^"']*(?:cf-chl-|challenge|turnstile)/i.test(text)
+  )) {
+    return true;
+  }
+
+  if (concreteChallengeMarkers.some((marker) => title.includes(marker))) {
+    return true;
+  }
+
+  return concreteChallengeMarkers.some((marker) => text.includes(marker)) ||
+    /<form[^>]+action=["'][^"']*(?:challenge|captcha|turnstile)/i.test(text) ||
+    /id=["'][^"']*(?:cf-chl-|challenge|turnstile)/i.test(text);
 }
 
 function extractMetaRefresh(body, baseUrl) {
